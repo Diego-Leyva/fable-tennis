@@ -7,7 +7,8 @@ const http = require('http').createServer(app);
 const io = new Server(http);
 app.use(express.static(__dirname + '/public'));
 app.get('/', (req, res) => res.redirect('/host.html'));
-app.get('/healthz', (req, res) => res.send('ok'));         // Railway health check
+const INSTANCE = (process.env.RAILWAY_REPLICA_ID || os.hostname()).slice(0, 8); // which process answered: host and phones must share one
+app.get('/healthz', (req, res) => res.send(`ok ${INSTANCE} rooms=${Object.keys(rooms).join(',')}`)); // Railway health check
 
 // Phones need HTTPS for motion sensors: also serve https:// on the LAN with a self-signed cert (generated once into certs/).
 // On a host that terminates TLS for us (Railway, or LOCAL_HTTPS=0) only the single $PORT is served.
@@ -23,7 +24,7 @@ if (LOCAL_HTTPS) try {
 const lanIp = () => (Object.values(os.networkInterfaces()).flat().find(i => i.family === 'IPv4' && !i.internal) || {}).address || 'localhost';
 const lanUrl = () => https ? `https://${lanIp()}:${HTTPS_PORT}/phone.html` : `http://${lanIp()}:${PORT}/phone.html`;
 
-const rooms = {}; // code -> { host: socketId, players: { socketId: { name, slot } } }
+const rooms = {}; // in memory, so the service must run as ONE instance. code -> { host: socketId, players: { socketId: { name, slot } } }
 const newCode = () => Array.from({ length: 4 }, () => 'ABCDEFGHJKLMNPQRSTUVWXYZ'[Math.floor(Math.random() * 23)]).join('');
 const playerList = (r) => Object.values(r.players);
 
@@ -31,11 +32,13 @@ io.on('connection', (socket) => {
   socket.on('host', (wanted) => {                             // big screen opens a room (keeps its code across server restarts)
     let code = wanted && !rooms[wanted] ? wanted : null; while (!code || rooms[code]) code = newCode();
     rooms[code] = { host: socket.id, players: {} };
-    socket.join(code); socket.room = code; socket.emit('room', { code, lanUrl: lanUrl() });
+    socket.join(code); socket.room = code; socket.emit('room', { code, lanUrl: lanUrl(), instance: INSTANCE });
+    console.log(`[${INSTANCE}] room ${code} opened`);
   });
   socket.on('join', ({ room, name }, cb = () => {}) => {       // phone joins as P1 or P2
     room = (room || '').toUpperCase().trim(); const r = rooms[room];
-    if (!r) return cb({ error: 'No such room. Check the code on the host screen and that the host page is open.' });
+    if (!r) { console.log(`[${INSTANCE}] join ${room}: no such room (open: ${Object.keys(rooms).join(',') || 'none'})`);
+      return cb({ error: `No such room on server ${INSTANCE}. Check the code on the host screen and that the host page is open.` }); }
     const slot = [1, 2].find(s => !playerList(r).some(p => p.slot === s));
     if (!slot) return cb({ error: 'Room is full' });
     r.players[socket.id] = { name: (name || '').trim().slice(0, 10) || 'P' + slot, slot };

@@ -364,8 +364,8 @@ addEventListener('keydown', e => {
 $('again').onclick = startGame;
 const socket = io(); let roomCode = null;
 socket.on('connect', () => socket.emit('host', roomCode));                                     // (re)create the room on every connect, same code after a server restart
-socket.on('room', ({ code, lanUrl }) => {                                                      // phones need https: tunnel origin if we are on one, else LAN https
-  roomCode = code; $('code').textContent = code; $('url').textContent = location.protocol === 'https:' ? location.origin + '/phone.html' : lanUrl; });
+socket.on('room', ({ code, lanUrl, instance }) => {                                                      // phones need https: tunnel origin if we are on one, else LAN https
+  roomCode = code; $('code').textContent = code; $('code').title = 'server ' + instance; $('url').textContent = location.protocol === 'https:' ? location.origin + '/phone.html' : lanUrl; });
 socket.on('players', list => {
   $('players').textContent = list.length ? list.map(p => `P${p.slot}: ${p.name}`).join('   ·   ') : 'Waiting for players…';
   for (const p of list) { players[p.slot - 1].name = p.name; players[p.slot - 1].tag.draw(p.name); $('l' + p.slot).textContent = p.name; }

@@ -35,10 +35,10 @@ const socket = io(), $ = id => document.getElementById(id);
 const MOVES = ['bounce', 'toss', 'serve', 'fh', 'fh_slice', 'fh_topspin', 'bh', 'bh_slice', 'bh_topspin'];
 
 let joined = null;                                          // { name, room } once in, so we can rejoin after a reconnect
-function join(retry = 0) {
+function join(retry = 0) {                                  // retries ~5 s: after a redeploy the host needs a moment to reopen its room
   const me = joined || { name: $('name').value, room: $('room').value };
   socket.emit('join', me, r => {
-    if (r.error) { if (joined && retry < 5) return setTimeout(() => join(retry + 1), 1000); return alert(r.error); }
+    if (r.error) { if (/No such room/.test(r.error) && retry < 5) return setTimeout(() => join(retry + 1), 1000); return alert(r.error); }
     joined = me; $('join').classList.add('hidden'); $('game').classList.remove('hidden');
     $('who').textContent = 'You are Player ' + r.slot;
   });
