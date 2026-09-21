@@ -8,3 +8,10 @@ Cartoon tennis on a big screen, phones as motion rackets (Node + Socket.IO + Thr
 - Character: put `public/assets/player.glb` (or `player.png` for a billboard sprite). Without one, a cute fallback blob is used.
 - Model: export your Edge Impulse project as WebAssembly and unzip `edge-impulse-standalone.js` + `.wasm` into `public/model/`.
 - Labels expected: idle, bounce, toss, serve, fh, fh_slice, fh_topspin, bh, bh_slice, bh_topspin.
+
+## Deploy on Railway
+1. Push this repo to GitHub, then in Railway: New Project → Deploy from GitHub repo (or `railway up` from this folder).
+2. Settings → Networking → Generate Domain. Railway provides HTTPS, so phones get motion sensors with no certificate warning.
+3. Open `https://<your-app>.up.railway.app` on the big screen (it redirects to `/host.html`); phones use the link shown in the lobby.
+- `railway.json` sets the start command, a `/healthz` health check, and **1 replica**. Rooms live in memory, so do not scale out, and a redeploy closes open rooms.
+- On Railway (`RAILWAY_ENVIRONMENT` is set) only `$PORT` is served and the local self-signed HTTPS server is skipped. Override with `LOCAL_HTTPS=0/1`.

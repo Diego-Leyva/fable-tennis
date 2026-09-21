@@ -6,11 +6,15 @@ const app = express();
 const http = require('http').createServer(app);
 const io = new Server(http);
 app.use(express.static(__dirname + '/public'));
+app.get('/', (req, res) => res.redirect('/host.html'));
+app.get('/healthz', (req, res) => res.send('ok'));         // Railway health check
 
 // Phones need HTTPS for motion sensors: also serve https:// on the LAN with a self-signed cert (generated once into certs/).
+// On a host that terminates TLS for us (Railway, or LOCAL_HTTPS=0) only the single $PORT is served.
 const PORT = process.env.PORT || 3000, HTTPS_PORT = process.env.HTTPS_PORT || 3443, CERT = __dirname + '/certs';
+const LOCAL_HTTPS = process.env.LOCAL_HTTPS ? process.env.LOCAL_HTTPS !== '0' : !process.env.RAILWAY_ENVIRONMENT;
 let https = null;
-try {
+if (LOCAL_HTTPS) try {
   if (!fs.existsSync(CERT + '/cert.pem')) { fs.mkdirSync(CERT, { recursive: true });
     execSync(`openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/CN=fable-tennis" -keyout "${CERT}/key.pem" -out "${CERT}/cert.pem"`, { stdio: 'ignore' }); }
   https = require('https').createServer({ key: fs.readFileSync(CERT + '/key.pem'), cert: fs.readFileSync(CERT + '/cert.pem') }, app);
@@ -58,4 +62,5 @@ io.on('connection', (socket) => {
 });
 
 http.listen(PORT, () => console.log(`Fable Tennis host: http://localhost:${PORT}/host.html`));
+process.on('SIGTERM', () => { io.close(); http.close(() => process.exit(0)); if (https) https.close(); });
 if (https) https.listen(HTTPS_PORT, () => console.log(`Phones (accept the certificate warning once): ${lanUrl()}`));
