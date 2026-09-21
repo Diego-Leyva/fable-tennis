@@ -1,0 +1,390 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Fable Tennis · Host</title>
+<style>
+body{margin:0;overflow:hidden;font-family:"Arial Rounded MT Bold","Nunito",system-ui,sans-serif;background:linear-gradient(#FFD9C4,#D9D2F5)}
+canvas{display:block}
+.card{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:#FFF5EBee;color:#5A3A2E;border-radius:28px;padding:28px 44px;text-align:center;box-shadow:0 12px 40px #0002;font-size:20px}
+.code{font-size:80px;letter-spacing:12px;color:#D97757;line-height:1.1}
+button{font:inherit;font-size:22px;border:0;border-radius:16px;padding:12px 28px;background:#D97757;color:#FFF5EB;cursor:pointer}
+#hint{position:fixed;bottom:22px;width:100%;text-align:center;font-size:30px;color:#5A3A2E;text-shadow:0 2px 0 #FFF5EB;pointer-events:none}
+#divider{position:fixed;left:50%;top:0;width:4px;height:100%;margin-left:-2px;background:#FFF5EB;display:none}
+.side{position:fixed;top:16px;padding:6px 18px;border-radius:14px;color:#FFF5EB;font-size:22px;display:none}
+#l1{left:16px;background:#5DADE2}#l2{right:16px;background:#F06292}
+.hidden{display:none}
+</style></head><body>
+<div id="lobby" class="card">
+  <div>Room code</div><div class="code" id="code">····</div>
+  <div id="url">…</div>
+  <div id="players" style="margin:16px 0;font-size:26px">Waiting for players…</div>
+  <small>Or press Enter for keyboard mode · P1: 1-9 · P2: Q-O<br>🔊 Click the screen once to enable sound</small>
+</div>
+<div id="winner" class="card hidden"><div id="wtext" style="font-size:40px;margin-bottom:18px"></div><button id="again">Play again</button></div>
+<div id="hint"></div><div id="divider"></div><div id="l1" class="side"></div><div id="l2" class="side"></div>
+<script src="/socket.io/socket.io.js"></script>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
+
+const $ = id => document.getElementById(id);
+const MOVES = ['bounce', 'toss', 'serve', 'fh', 'fh_slice', 'fh_topspin', 'bh', 'bh_slice', 'bh_topspin'];
+const G = 9.8, HAND_Y = 1.0, BALL_R = 0.16, TMP = new THREE.Vector3(), FONT = '"Arial Rounded MT Bold", "Nunito", system-ui, sans-serif';
+// Shot feel: flight time to landing, gravity multiplier (dip), bounce restitution, speed kept after the bounce.
+const SWINGS = MOVES.slice(3), PICK_TH = 0.3;                    // model mode: fire the most probable *allowed* move if its probability >= PICK_TH
+const HIT_BEFORE = 0.4, HIT_AFTER = 1000;                          // hit window opens 0.4 s before the ball arrives; the ball then hovers up to 1 s
+const SERVE_HOVER = 1500;                                          // ms the tossed ball hangs at its apex waiting for the strike
+const serveOpen = now => ball.mode === 'toss' && now >= apexAt - 300;
+const SHOTS = { flat: { T: 0.8, g: 1, rest: 0.7, skid: 0.8 }, topspin: { T: 1.0, g: 1.5, rest: 0.95, skid: 0.7 }, slice: { T: 1.4, g: 0.5, rest: 0.45, skid: 0.92 } };
+
+// ---------- Renderer, cel shading helpers, lights ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });     // alpha: CSS sky gradient shows through
+renderer.setPixelRatio(devicePixelRatio); renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap; renderer.shadowMap.autoUpdate = false; // one shadow pass per frame
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 200);                                   // lobby + intro (full screen)
+const cams = [1, -1].map(s => { const c = new THREE.PerspectiveCamera(45, 1, 0.1, 200); c.position.set(0, 9, 27 * s); c.lookAt(0, 0.6, -3 * s); return c; }); // split: behind P1, behind P2
+function resize() { renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  cams.forEach(c => { c.aspect = innerWidth / 2 / innerHeight; c.updateProjectionMatrix(); }); }
+addEventListener('resize', resize); resize();
+
+const gradientMap = new THREE.DataTexture(new Uint8Array([110, 190, 255]), 3, 1, THREE.RedFormat); gradientMap.needsUpdate = true; // 3-step ramp
+const toon = (color, extra = {}) => new THREE.MeshToonMaterial({ color, gradientMap, ...extra });
+const rbox = (w, h, d, r = 0.15) => new RoundedBoxGeometry(w, h, d, 4, r);
+function mesh(geo, color, x = 0, y = 0, z = 0, parent = scene) {
+  const m = new THREE.Mesh(geo, toon(color)); m.position.set(x, y, z); m.castShadow = m.receiveShadow = true; parent.add(m); return m;
+}
+scene.add(new THREE.HemisphereLight(0xFFF5EB, 0xD97757, 1.3));
+const sun = new THREE.DirectionalLight(0xFFF0DD, 1.8); sun.position.set(8, 18, 12); sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048); Object.assign(sun.shadow.camera, { left: -22, right: 22, top: 26, bottom: -26 });
+sun.shadow.camera.updateProjectionMatrix(); scene.add(sun);
+
+// ---------- Court and net ----------
+mesh(rbox(20, 0.4, 36, 0.15), 0xF0C4A8, 0, -0.22, 0);                                     // rounded surround
+mesh(new THREE.BoxGeometry(11, 0.06, 24), 0xD97757, 0, -0.03, 0);                          // hardcourt
+const line = (w, d, x, z) => mesh(new THREE.BoxGeometry(w, 0.01, d), 0xFFF5EB, x, 0.005, z);
+line(11, 0.1, 0, 12); line(11, 0.1, 0, -12); line(0.1, 24, -5.5, 0); line(0.1, 24, 5.5, 0);      // baselines, sidelines
+line(0.1, 24, -4.1, 0); line(0.1, 24, 4.1, 0); line(8.2, 0.1, 0, -6.4); line(8.2, 0.1, 0, 6.4); line(0.1, 12.8, 0, 0); // singles, service
+mesh(rbox(12, 0.9, 0.12, 0.05), 0xFFF5EB, 0, 0.47, 0);                                      // puffy net
+mesh(new THREE.CapsuleGeometry(0.06, 12, 4, 8).rotateZ(Math.PI / 2), 0xFFF5EB, 0, 0.95, 0);  // net band
+[-6.2, 6.2].forEach(x => mesh(new THREE.CapsuleGeometry(0.13, 0.9, 4, 12), 0x5A3A2E, x, 0.55, 0)); // rounded posts
+
+// ---------- Stands with blob spectators ----------
+const fans = [], PALETTE = [0xF4A9A8, 0xA8D8EA, 0xFFE59D, 0xB8E0B0, 0xD9C2F0, 0xFFC38B];
+[-1, 1].forEach(side => [0, 1, 2].forEach(tier => {
+  const h = 1 + tier, x = side * (12.5 + tier * 2.2);
+  mesh(rbox(2.2, h, 32, 0.2), 0xF7D9C6, x, h / 2 - 0.02, 0);                                // stacked rounded block
+  for (let i = 0; i < 13; i++) {
+    const f = mesh(new THREE.SphereGeometry(0.34, 16, 12), PALETTE[(i + tier) % 6], x, h + 0.3, -15 + i * 2.5 + Math.random());
+    [-0.1, 0.1].forEach(dz => mesh(new THREE.SphereGeometry(0.045, 8, 6), 0x3A2A22, -side * 0.33, 0.06, dz, f)); // dot eyes facing the court
+    f.userData = { y: h + 0.3, phase: Math.random() * 7 }; fans.push(f);
+  }
+}));
+
+// ---------- Canvas-texture signs, scoreboard, name tags ----------
+function textTex(w, h, bg, fg, size) {
+  const c = document.createElement('canvas'); c.width = 1024; c.height = Math.round(1024 * h / w); const g = c.getContext('2d');
+  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
+  tex.draw = text => {
+    g.clearRect(0, 0, c.width, c.height); g.fillStyle = bg; g.beginPath(); g.roundRect(6, 6, c.width - 12, c.height - 12, c.height / 3); g.fill();
+    let f = size; g.font = `bold ${f}px ${FONT}`; while (g.measureText(text).width > c.width - 100 && f > 20) g.font = `bold ${f -= 4}px ${FONT}`;
+    g.fillStyle = fg; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(text, c.width / 2, c.height / 2); tex.needsUpdate = true;
+  };
+  return tex;
+}
+function sign(text, w, h, x, y, z, bg = '#FFF5EB', fg = '#D97757', size = 120) {
+  const tex = textTex(w, h, bg, fg, size); tex.draw(text);
+  for (const s of [1, -1]) {                                                                   // one copy per end of the court
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), toon(0xFFFFFF, { map: tex, transparent: true }));
+    m.position.set(x * s, y, z * s); m.rotation.y = s > 0 ? 0 : Math.PI; scene.add(m);
+  }
+  return tex;
+}
+sign('Anthropic Stadium', 16, 2.6, 0, 6.6, -20);
+sign('Claude Open', 7, 1.6, -8.5, 3.2, -20, '#D97757', '#FFF5EB');
+sign('Claude Legends Court', 7, 1.6, 8.5, 3.2, -20, '#D97757', '#FFF5EB');
+const board = sign('0 – 0', 8, 2.6, 0, 3.4, -20, '#5A3A2E', '#FFF5EB', 150);
+
+// ---------- Camera: 5 s orbit intro, then fixed behind the court ----------
+const CAM = new THREE.Vector3(0, 9, 27), LOOK = new THREE.Vector3(0, 0.6, -3); let introStart = -1;
+function updateCamera(now) {
+  const t = (now - introStart) / 5000;
+  if (introStart < 0 || t >= 1) camera.position.copy(CAM);
+  else { const e = t * t * (3 - 2 * t), a = Math.PI * 2 * (e - 1); camera.position.set(Math.sin(a) * 27, 9 + 7 * Math.sin(Math.PI * e), Math.cos(a) * 27); }
+  camera.lookAt(LOOK);
+}
+
+// ---------- Ball: gravity + damped bounces, squash and dust on impact ----------
+const ball = mesh(new THREE.SphereGeometry(BALL_R, 24, 16), 0xE9FF4A);
+const glow = mesh(new THREE.TorusGeometry(0.34, 0.035, 8, 28), 0xFFF5EB, 0, 0, 0, ball);     // serve-window cue
+glow.material.emissive.set(0xFFF0C0); glow.castShadow = false; glow.visible = false;
+Object.assign(ball, { vel: new THREE.Vector3(), gMul: 1, rest: 0.7, skid: 0.8, sq: 0, bounces: 0, mode: 'hand' });
+const puffs = [];
+function puff(pos) {
+  for (let i = 0; i < 6; i++) {
+    const p = mesh(new THREE.SphereGeometry(0.08, 8, 6), 0xFFF5EB, pos.x, 0.06, pos.z); p.castShadow = false; p.material.transparent = true;
+    p.vel = new THREE.Vector3(Math.random() - 0.5, 0.8 + Math.random(), Math.random() - 0.5).multiplyScalar(1.6); p.life = 1; puffs.push(p);
+  }
+}
+function stepBall(dt, now) {
+  if (ball.mode === 'hand') {                                                                 // ball rests in the server's free hand
+    const g = players[server - 1].group.position, s = server === 1 ? 1 : -1;
+    ball.position.set(g.x - 0.35 * s, HAND_Y, g.z - 0.4 * s);
+  } else if (ball.mode === 'contact') {                                                       // pulled onto the racket head until contact
+    ball.position.lerp(ball.holder.racket.head.getWorldPosition(TMP), Math.min(1, dt * 25));
+  } else {
+    const h = ball.hover ? dt * 0.08 : dt;                                                   // hovering at the player: near-frozen "hit me" moment
+    ball.vel.y -= G * ball.gMul * h; ball.position.addScaledVector(ball.vel, h);
+    if (ball.position.y < BALL_R && ball.vel.y < 0 && ball.mode !== 'bounce' && ball.vel.y > -1.2) { // too slow to bounce: roll and settle
+      ball.position.y = BALL_R; ball.vel.y = 0; ball.vel.x *= 0.9; ball.vel.z *= 0.9;
+    } else if (ball.position.y < BALL_R && ball.vel.y < 0) {                                   // bounce
+      ball.position.y = BALL_R; ball.bounces++; ball.sq = 0.45; puff(ball.position);
+      ball.vel.y = ball.mode === 'bounce' ? Math.sqrt(2 * G * (HAND_Y - BALL_R)) : -ball.vel.y * ball.rest;
+      ball.vel.x *= ball.skid; ball.vel.z *= ball.skid; sfx('bounce', Math.min(1, Math.abs(ball.vel.y) / 6));
+      if (ball.mode === 'play' && ball.bounces >= 2) point(ball.hitter, 'Double bounce!');
+    }
+    if (ball.mode === 'bounce' && ball.bounces && ball.vel.y <= 0) toHand();                  // came back up to the hand
+    if (ball.mode === 'toss' && ball.vel.y <= 0 && !ball.hovered) {                          // top of the toss: hang there for SERVE_HOVER
+      ball.hover = ball.hovered = true; ball.hoverUntil = now + SERVE_HOVER; hint(`${players[server - 1].name}: SERVE NOW`); sfx('ready'); }
+    if (ball.hover && ball.mode === 'toss' && now > ball.hoverUntil) ball.hover = false;
+    if (ball.mode === 'toss' && ball.vel.y < 0 && ball.position.y < HAND_Y) fault('Too late');
+  }
+  glow.visible = serveOpen(now) || (ball.mode === 'play' && !!win); glow.rotation.x += dt * 5;
+  ball.sq *= 0.85; ball.scale.set(1 + ball.sq * 0.5, 1 - ball.sq, 1 + ball.sq * 0.5);
+  for (const p of puffs) { p.life -= dt * 2.5; p.vel.y -= 4 * dt; p.position.addScaledVector(p.vel, dt); p.material.opacity = Math.max(0, p.life); p.scale.setScalar(1.5 - p.life); }
+  for (let i = puffs.length - 1; i >= 0; i--) if (puffs[i].life <= 0) scene.remove(puffs.splice(i, 1)[0]);
+}
+
+// ---------- Players: user asset (glb > png > fallback blob), racket, ring, name tag ----------
+async function loadCharacter() {                                                                // returns a factory for one character
+  try {
+    const gltf = await new GLTFLoader().loadAsync('/assets/player.glb');
+    const box = new THREE.Box3().setFromObject(gltf.scene), s = 1.2 / box.getSize(new THREE.Vector3()).y, c = box.getCenter(new THREE.Vector3());
+    gltf.scene.traverse(o => { if (o.isMesh) { o.material = toon(o.material.color || 0xFFFFFF, { map: o.material.map || null, vertexColors: !!o.material.vertexColors }); o.castShadow = true; } });
+    return () => { const m = cloneSkinned(gltf.scene); m.scale.setScalar(s); m.position.set(-c.x * s, -box.min.y * s, -c.z * s); return m; };
+  } catch {}
+  try {
+    const tex = await new THREE.TextureLoader().loadAsync('/assets/player.png'); tex.colorSpace = THREE.SRGBColorSpace;
+    const asp = tex.image.width / tex.image.height;
+    return () => { const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex })); sp.scale.set(1.2 * asp, 1.2, 1); sp.position.y = 0.6; return sp; };
+  } catch {}
+  return () => {                                                                                // round cute blob
+    const c = new THREE.Group();
+    mesh(new THREE.SphereGeometry(0.5, 24, 18), 0xFFE0C2, 0, 0.6, 0, c);
+    [-0.16, 0.16].forEach(x => mesh(new THREE.SphereGeometry(0.05, 8, 8), 0x3A2A22, x, 0.72, 0.45, c));
+    [-0.55, 0.55].forEach(x => mesh(new THREE.CapsuleGeometry(0.09, 0.22, 4, 8).rotateZ(Math.PI / 2), 0xFFE0C2, x, 0.5, 0, c));
+    return c;
+  };
+}
+function makeRacket() {                                                                         // pivot at body center; arm slides to the fh (right) or bh (left) side
+  const r = new THREE.Group(); r.position.y = 0.55; r.arm = new THREE.Group(); r.arm.position.x = -0.6; r.add(r.arm);
+  mesh(new THREE.CapsuleGeometry(0.035, 0.3, 4, 8), 0x5A3A2E, 0, 0, 0, r.arm);
+  r.head = mesh(new THREE.TorusGeometry(0.17, 0.045, 8, 24), 0xD97757, 0, 0.36, 0, r.arm);
+  mesh(new THREE.CircleGeometry(0.15, 24), 0xFFF5EB, 0, 0.36, 0, r.arm).material.side = THREE.DoubleSide;
+  return r;
+}
+const makeChar = await loadCharacter();
+const players = [1, 2].map(slot => {
+  const dir = slot === 1 ? -1 : 1;                                                              // facing direction (toward the net)
+  const group = new THREE.Group(); group.position.set(0, 0, -dir * 10); group.rotation.y = slot === 1 ? Math.PI : 0; scene.add(group);
+  const body = new THREE.Group(); group.add(body); body.add(makeChar()); const racket = makeRacket(); body.add(racket);
+  mesh(new THREE.TorusGeometry(0.7, 0.07, 8, 32).rotateX(Math.PI / 2), slot === 1 ? 0x5DADE2 : 0xF06292, 0, 0.03, 0, group); // colored ring
+  const tag = textTex(3, 1, slot === 1 ? '#5DADE2' : '#F06292', '#FFF5EB', 150); tag.draw('P' + slot);
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tag })); sprite.scale.set(1.5, 0.5, 1); sprite.position.y = 1.85; group.add(sprite);
+  return { slot, dir, name: 'P' + slot, group, body, racket, tag, sq: 0, sqTarget: 0, target: new THREE.Vector3(0, 0, -dir * 10),
+    pose: { rotY: 0, rotX: 0, y: 0.55, armX: -0.6, bodyRot: 0 } };                             // animation targets, lerped each frame
+});
+window.fable = { players, ball, get SFX() { return SFX; }, get audio() { return actx; } };       // console / test hook
+// Swing timeline: wind-up (squash, shoulders turn, racket back on the shot side) -> contact at 120 ms (stretch) ->
+// follow-through across the body -> back to the ready pose. side = +1 forehand, -1 backhand (arm crosses to the left).
+function swingAnim(p, side = 1, serve = false) {
+  const q = p.pose, at = (ms, f) => setTimeout(f, ms); sfx('swing');
+  p.sqTarget = -0.3; q.armX = side > 0 ? -0.6 : 0.5; q.bodyRot = -0.5 * side;
+  if (serve) { q.y = 1.8; p.racket.rotation.x = -1.4; q.rotX = 0.7; q.rotY = 0; }                 // overhead: racket up and back, then forward
+  else { p.racket.rotation.y = -1.0 * side; q.rotY = 0.3 * side; }                             // racket behind, meets the ball at the side
+  at(120, () => { p.sqTarget = 0.35; q.bodyRot = 0.1 * side; if (!serve) q.rotY = 1.3 * side; });
+  at(320, () => { p.sqTarget = 0; q.bodyRot = 0.4 * side; });
+  at(550, () => { Object.assign(q, { rotY: 0, rotX: 0, y: 0.55, armX: -0.6, bodyRot: 0 }); });
+}
+function updatePlayers(dt, t) {
+  for (const p of players) {
+    const g = p.group, d = p.target.clone().sub(g.position), moving = d.length() > 0.05;
+    g.position.addScaledVector(d, Math.min(1, dt * 6));
+    p.sq += (p.sqTarget - p.sq) * Math.min(1, dt * 18);
+    const q = p.pose, r = p.racket, k = Math.min(1, dt * 14);                                   // ease racket + torso toward the pose targets
+    r.rotation.y += (q.rotY - r.rotation.y) * k; r.rotation.x += (q.rotX - r.rotation.x) * k; r.position.y += (q.y - r.position.y) * k;
+    r.arm.position.x += (q.armX - r.arm.position.x) * k; p.body.rotation.y += (q.bodyRot - p.body.rotation.y) * k;
+    p.body.position.y = Math.sin(t * 2 + p.slot) * 0.03 + (moving ? Math.abs(Math.sin(t * 14)) * 0.15 : 0);   // breathing bob + hop
+    p.body.scale.set(1 - p.sq * 0.5, 1 + p.sq + Math.sin(t * 2 + p.slot) * 0.02, 1 - p.sq * 0.5);
+  }
+}
+function updateFans(t, now) {
+  const cheer = now < cheerUntil;
+  for (const f of fans) f.position.y = f.userData.y + (cheer ? Math.abs(Math.sin(t * 9 + f.userData.phase)) * 0.5 : Math.sin(t * 2 + f.userData.phase) * 0.04);
+}
+
+// ---------- Sounds: tiny Web Audio synth, no files. Browsers need one click/keypress on the page before audio plays. ----------
+const VOLUME = 0.8; let actx = null, master = null;
+function audio() {
+  if (!actx) { actx = new (window.AudioContext || window.webkitAudioContext)(); master = actx.createGain(); master.gain.value = VOLUME; master.connect(actx.destination); }
+  if (actx.state === 'suspended') actx.resume(); return actx;
+}
+addEventListener('pointerdown', audio); addEventListener('keydown', audio);
+function noise(dur, { freq = 1000, q = 1, gain = 0.5, attack = 0.005, type = 'bandpass', when = 0 } = {}) {   // filtered noise burst
+  const c = audio(), t = c.currentTime + when, buf = c.createBuffer(1, Math.ceil(c.sampleRate * dur), c.sampleRate), d = buf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  const src = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain();
+  src.buffer = buf; f.type = type; f.frequency.value = freq; f.Q.value = q;
+  g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(gain, t + attack); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  src.connect(f).connect(g).connect(master); src.start(t); src.stop(t + dur);
+}
+function tone(freq, dur, { gain = 0.3, type = 'sine', when = 0, slide = 0 } = {}) {                              // simple enveloped oscillator
+  const c = audio(), t = c.currentTime + when, o = c.createOscillator(), g = c.createGain();
+  o.type = type; o.frequency.setValueAtTime(freq, t); if (slide) o.frequency.exponentialRampToValueAtTime(slide, t + dur);
+  g.gain.setValueAtTime(gain, t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g).connect(master); o.start(t); o.stop(t + dur);
+}
+const SFX = {
+  hit: () => { noise(0.07, { freq: 2000, q: 0.7, gain: 0.7 }); tone(170, 0.13, { gain: 0.5, slide: 80 }); },              // racket "pock"
+  bounce: v => { noise(0.05, { freq: 500, q: 1, gain: 0.3 * v }); tone(110, 0.09, { gain: 0.3 * v, slide: 60 }); },       // ball thud
+  swing: () => noise(0.22, { freq: 900, q: 0.4, gain: 0.18, attack: 0.08, type: 'lowpass' }),                           // whoosh
+  ready: () => tone(880, 0.12, { gain: 0.12, type: 'triangle' }),                                                       // "hit now" ding
+  fault: () => tone(200, 0.35, { gain: 0.25, type: 'square', slide: 100 }),
+  point: () => { noise(1.8, { freq: 2600, q: 0.3, gain: 0.35, attack: 0.35 });                                           // applause: swell + claps
+    for (let i = 0; i < 30; i++) noise(0.025, { freq: 1800 + Math.random() * 2500, q: 2, gain: 0.3, when: 0.05 + Math.random() * 1.5 }); },
+  win: () => { [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.55, { gain: 0.3, type: 'triangle', when: i * 0.17 })); SFX.point(); },
+};
+const sfx = (name, ...a) => { try { if (actx && actx.state === 'running') SFX[name](...a); } catch (e) { console.warn('sfx', e); } }; // silent until the page was clicked
+
+// ---------- Game logic ----------
+let state = 'lobby', pts = [0, 0], server = 1, faults = 0, apexAt = 0, win = null, cheerUntil = 0;
+const hint = m => $('hint').textContent = m, other = s => 3 - s;
+const scoreText = () => { const [a, b] = pts, N = ['0', '15', '30', '40'];
+  return a >= 3 && b >= 3 ? (a === b ? 'DEUCE' : 'AD ' + players[a > b ? 0 : 1].name) : `${N[Math.min(a, 3)]} – ${N[Math.min(b, 3)]}`; };
+const updateBoard = () => board.draw(`${players[0].name}   ${scoreText()}   ${players[1].name}`);
+function toHand() { ball.mode = 'hand'; ball.vel.set(0, 0, 0); ball.gMul = 1; ball.bounces = 0; ball.sq = 0; ball.hover = false; }
+function launch(to, T, gMul) {                                                                  // parabola from the ball to `to` in T seconds
+  const p = ball.position; ball.gMul = gMul;
+  ball.vel.set((to.x - p.x) / T, (to.y - p.y) / T + 0.5 * G * gMul * T, (to.z - p.z) / T);
+}
+function inFlight(from, land, prefix = '') {                                                    // ball is live; receiver runs behind the landing spot
+  const r = players[other(from) - 1]; ball.mode = 'play'; ball.hitter = from; ball.bounces = 0; ball.winDone = false; ball.hover = false; win = null;
+  const side = Math.random() < 0.5 ? 0.7 : -0.7;                                                 // ball arrives on a random side
+  r.target.set(THREE.MathUtils.clamp(land.x + side, -4.6, 4.6), 0, land.z - r.dir * 1.2);
+  players[from - 1].target.set(0, 0, -players[from - 1].dir * 10);
+  const fh = (land.x - r.target.x) * (r.slot === 1 ? 1 : -1) > 0;                                // right-handed: ball on the right = forehand
+  hint(`${prefix}${r.name}: ${fh ? 'FOREHAND' : 'BACKHAND'}!`); socket.emit('hit', from); sfx('hit');
+}
+function swing(slot, label) {
+  const p = players[slot - 1], [side, kind = 'flat'] = label.split('_'), s = side === 'fh' ? 1 : -1, right = slot === 1 ? 1 : -1;
+  swingAnim(p, s);
+  if (ball.mode !== 'play' || !win || win.slot !== slot) return;                                 // whiff
+  const weak = (Math.sign(ball.position.x - p.group.position.x) * right || 1) !== s;             // ball on the other side = stretched, weak return
+  win = null; ball.mode = 'contact'; ball.holder = p;
+  setTimeout(() => {                                                                             // strike from the racket head at contact
+    if (ball.mode !== 'contact') return;
+    const sh = SHOTS[kind], cross = Math.random() < 0.7 ? -1 : 1;                                // mostly cross-court, sometimes down the line
+    const land = new THREE.Vector3(THREE.MathUtils.clamp(cross * s * right * (0.5 + Math.random() * 3.5), -4.5, 4.5), BALL_R,
+      p.dir * (weak ? 2.5 + Math.random() * 3 : 6 + Math.random() * 4));
+    launch(land, sh.T * (weak ? 1.4 : 1), weak ? 0.8 : sh.g); ball.rest = sh.rest; ball.skid = sh.skid;
+    inFlight(slot, land, weak ? 'Weak return… ' : '');
+  }, 120);
+}
+function serveMove(slot, label) {
+  if (slot !== server) return;
+  const p = players[slot - 1], now = performance.now();
+  if (label === 'bounce' && ball.mode === 'hand') { ball.mode = 'bounce'; ball.vel.set(0, -1, 0); }
+  if (label === 'toss' && ball.mode === 'hand') { ball.mode = 'toss'; ball.hovered = false; ball.vel.set(0, G * 0.6, 0); apexAt = now + 600; } // 0.6 s up, then hangs
+  if (label === 'serve') {
+    if (!serveOpen(now)) return;                                                               // only reachable when allowed
+    swingAnim(p, 1, true); ball.mode = 'contact'; ball.hover = false; ball.holder = p;
+    setTimeout(() => {
+      if (ball.mode !== 'contact') return;
+      const land = new THREE.Vector3((Math.random() - 0.5) * 6, BALL_R, p.dir * (3 + Math.random() * 3)); // into the service box
+      launch(land, 0.7, 1); ball.rest = 0.7; ball.skid = 0.8; inFlight(slot, land, 'Serve! ');
+    }, 120);
+  }
+}
+function fault(why) { if (++faults >= 2) return point(other(server), 'Double fault!'); toHand(); hint(`${why} – fault, second serve`); sfx('fault'); }
+function updateRally(now) {                                                                     // hit window: approach, then hover at the player
+  if (ball.mode !== 'play') return;
+  const r = players[other(ball.hitter) - 1], tReach = (r.group.position.z - ball.position.z) / ball.vel.z;
+  if (!win && !ball.winDone && tReach <= HIT_BEFORE) { win = { slot: r.slot, until: Infinity }; ball.winDone = true; }
+  if (win && !ball.hover && tReach <= 0.05) {                                                    // ball reached the player: freeze-ish for HIT_AFTER ms
+    ball.hover = true; win.until = now + HIT_AFTER; sfx('ready');
+    hint(`${r.name}: HIT NOW (${(ball.position.x - r.group.position.x) * (r.slot === 1 ? 1 : -1) > 0 ? 'forehand' : 'backhand'})`);
+  }
+  if (win && now > win.until) point(ball.hitter, 'Missed!');
+}
+function point(w, why) {
+  ball.mode = 'dead'; ball.hover = false; win = null; pts[w - 1]++; faults = 0; cheerUntil = performance.now() + 2000; sfx('point');
+  hint(`${why}  Point ${players[w - 1].name}`); updateBoard();
+  const [a, b] = pts, over = Math.max(a, b) >= 4 && Math.abs(a - b) >= 2;
+  setTimeout(() => over ? gameOver(w) : nextPoint(), 2200);
+}
+function nextPoint() { server = other(server); toHand(); players.forEach(p => p.target.set(0, 0, -p.dir * 10)); hint(`${players[server - 1].name} to serve: bounce · toss · serve`); }
+function gameOver(w) { state = 'over'; sfx('win'); $('wtext').textContent = `🏆 ${players[w - 1].name} wins the game!`; $('winner').classList.remove('hidden'); }
+function startGame() {
+  $('lobby').classList.add('hidden'); $('winner').classList.add('hidden');
+  state = 'play'; pts = [0, 0]; server = 2; faults = 0; introStart = performance.now(); updateBoard(); nextPoint();
+  players.forEach(p => $('l' + p.slot).textContent = p.name);
+}
+
+// ---------- Input: phones via Socket.IO, keyboard mock (P1 1-9, P2 Q-O) ----------
+function allowed(slot) {                                                                       // moves that make sense right now for this player
+  if (state !== 'play') return [];
+  if (ball.mode === 'hand') return slot === server ? ['bounce', 'toss'] : [];
+  if (ball.mode === 'toss') return slot === server && serveOpen(performance.now()) ? ['serve'] : [];
+  if (ball.mode === 'play' && win && win.slot === slot) return SWINGS;
+  return [];
+}
+function onMove(slot, label) {                                                                  // discrete move (phone detector, mock buttons, keyboard)
+  if (state !== 'play' || !MOVES.includes(label)) return;
+  const ok = allowed(slot).includes(label);
+  if (SWINGS.includes(label)) return ok ? swing(slot, label) : swingAnim(players[slot - 1], label.startsWith('fh') ? 1 : -1); // whiff
+  if (ok) return serveMove(slot, label);
+  // bounce / toss / serve outside the serve phase are dropped silently; only the server gets a hint while still serving
+  if (slot === server && label === 'serve' && ball.mode === 'hand') hint('Toss first!');
+  else if (slot === server && label === 'serve' && ball.mode === 'toss') hint('Too early, wait for the top of the toss');
+}
+function onProbs(slot, probs, g) {                                                              // model output: most probable allowed move, once per gesture
+  const p = players[slot - 1], ok = allowed(slot); if (!ok.length || g === p.lastGesture) return;
+  const best = ok.reduce((b, l) => (probs[l] || 0) > (probs[b] || 0) ? l : b), v = probs[best] || 0;
+  if (v < PICK_TH || v < (probs.idle || 0)) return;
+  p.lastGesture = g; socket.emit('fb', { slot, label: best }); onMove(slot, best);
+}
+addEventListener('keydown', e => {
+  if (e.key === 'Enter' && state !== 'play') return startGame();
+  const k = e.key.toLowerCase(); if (k.length !== 1) return;
+  const i1 = '123456789'.indexOf(k), i2 = 'qwertyuio'.indexOf(k);
+  if (i1 >= 0) onMove(1, MOVES[i1]); else if (i2 >= 0) onMove(2, MOVES[i2]);
+});
+$('again').onclick = startGame;
+const socket = io(); let roomCode = null;
+socket.on('connect', () => socket.emit('host', roomCode));                                     // (re)create the room on every connect, same code after a server restart
+socket.on('room', ({ code, lanUrl }) => {                                                      // phones need https: tunnel origin if we are on one, else LAN https
+  roomCode = code; $('code').textContent = code; $('url').textContent = location.protocol === 'https:' ? location.origin + '/phone.html' : lanUrl; });
+socket.on('players', list => {
+  $('players').textContent = list.length ? list.map(p => `P${p.slot}: ${p.name}`).join('   ·   ') : 'Waiting for players…';
+  for (const p of list) { players[p.slot - 1].name = p.name; players[p.slot - 1].tag.draw(p.name); $('l' + p.slot).textContent = p.name; }
+  updateBoard(); if (list.length === 2 && state === 'lobby') setTimeout(startGame, 1500);
+});
+socket.on('move', m => onMove(m.slot, m.label));
+socket.on('probs', m => onProbs(m.slot, m.p, m.g));
+
+// ---------- Loop ----------
+let last = performance.now();
+requestAnimationFrame(function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.05, (now - last) / 1000), t = now / 1000; last = now;
+  updateCamera(now); stepBall(dt, now); updateRally(now); updatePlayers(dt, t); updateFans(t, now);
+  const w = innerWidth, h = innerHeight, split = state !== 'lobby' && now - introStart >= 5000;
+  renderer.shadowMap.needsUpdate = true; renderer.setScissorTest(split);
+  if (!split) { renderer.setViewport(0, 0, w, h); renderer.render(scene, camera); }
+  else cams.forEach((c, i) => { renderer.setViewport(i * w / 2, 0, w / 2, h); renderer.setScissor(i * w / 2, 0, w / 2, h); renderer.render(scene, c); });
+  for (const el of ['divider', 'l1', 'l2']) $(el).style.display = split ? 'block' : 'none';
+});
+</script>
+</body></html>

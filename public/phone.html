@@ -1,0 +1,176 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Fable Tennis · Phone</title>
+<style>
+body{margin:0;padding:16px;font-family:"Arial Rounded MT Bold",system-ui,sans-serif;background:#F0C4A8;color:#5A3A2E;text-align:center}
+input,button{font:inherit;font-size:18px;border:0;border-radius:14px;padding:12px;margin:6px 0;width:100%;box-sizing:border-box}
+button{background:#D97757;color:#FFF5EB;font-weight:700}
+#calib{background:#5DADE2}
+#pad{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:12px}
+#pad button{padding:24px 0;background:#5A3A2E}
+#last{font-size:34px;font-weight:800;min-height:44px;margin:12px 0 4px;color:#D97757}
+#grip{font-size:14px}
+#sens,#dbg{font-size:13px;opacity:.75;min-height:18px}
+.hidden{display:none}
+</style></head><body>
+<h2>🎾 Fable Tennis</h2>
+<div id="join">
+  <input id="name" placeholder="Your name" maxlength="10">
+  <input id="room" placeholder="Room code" maxlength="4" style="text-transform:uppercase">
+  <button onclick="join()">Join</button>
+</div>
+<div id="game" class="hidden">
+  <div id="who"></div>
+  <button id="motion" onclick="enableMotion()">Enable motion</button>
+  <div id="grip">Hold the phone like a racket handle: top of the phone = racket head.</div>
+  <div id="sens"></div>
+  <button id="calib" class="hidden" onclick="calibrate()">Calibrate: swing a forehand</button>
+  <div id="last">–</div>
+  <div id="dbg"></div>
+  <div id="pad"></div>
+</div>
+<script src="/socket.io/socket.io.js"></script>
+<script>
+const socket = io(), $ = id => document.getElementById(id);
+const MOVES = ['bounce', 'toss', 'serve', 'fh', 'fh_slice', 'fh_topspin', 'bh', 'bh_slice', 'bh_topspin'];
+
+let joined = null;                                          // { name, room } once in, so we can rejoin after a reconnect
+function join(retry = 0) {
+  const me = joined || { name: $('name').value, room: $('room').value };
+  socket.emit('join', me, r => {
+    if (r.error) { if (joined && retry < 5) return setTimeout(() => join(retry + 1), 1000); return alert(r.error); }
+    joined = me; $('join').classList.add('hidden'); $('game').classList.remove('hidden');
+    $('who').textContent = 'You are Player ' + r.slot;
+  });
+}
+socket.on('connect', () => joined && join());                 // server restarted or network blip: rejoin the same room
+function send(label, confidence = 1) {                     // every move goes through here
+  socket.emit('move', { label, confidence });
+  $('last').textContent = label; navigator.vibrate && navigator.vibrate(30);
+}
+// Mock mode: one big button per move.
+MOVES.forEach(m => { const b = document.createElement('button'); b.textContent = m; b.onclick = () => send(m); $('pad').appendChild(b); });
+socket.on('hit', () => navigator.vibrate && navigator.vibrate([40, 30, 80]));   // host says we hit the ball
+socket.on('fb', label => { $('last').textContent = label; navigator.vibrate && navigator.vibrate(30); }); // host accepted a model move
+socket.on('closed', () => { alert('Host left'); location.reload(); });
+
+async function enableMotion() {
+  try { if (window.DeviceMotionEvent?.requestPermission && await DeviceMotionEvent.requestPermission() !== 'granted') throw 0; } // iOS prompt
+  catch { return alert('Motion permission denied. Reload and tap Allow (iOS: Settings › Safari › Motion & Orientation Access).'); }
+  try { await navigator.wakeLock.request('screen'); } catch {}
+  $('motion').disabled = true; monitorSensors();
+  $('motion').textContent = 'Motion on · ' + await startClassifier(send);
+}
+// Sensor health line, so problems are visible on the phone itself.
+function monitorSensors() {
+  let n = 0, accel = '', gyro = false, peak = 0, peakT = 0;
+  addEventListener('devicemotion', e => {
+    n++; const lin = e.acceleration?.x != null, a = lin ? e.acceleration : e.accelerationIncludingGravity;
+    if (a?.x != null) { accel = lin ? '✓' : 'gravity only'; const m = Math.abs(Math.hypot(a.x, a.y, a.z) - (lin ? 0 : 9.8)); if (m > peak) { peak = m; peakT = Date.now(); } }
+    if (e.rotationRate?.alpha != null) gyro = true;
+  });
+  setInterval(() => {
+    if (Date.now() - peakT > 2000) peak = 0;
+    $('sens').textContent = accel ? `sensors ${n * 2}/s · accel ${accel} · gyro ${gyro ? '✓' : '✗'} · peak |a| ${peak.toFixed(0)} m/s² (swing needs > ${START})`
+      : isSecureContext ? 'No motion data. Open the link directly in Safari or Chrome, not inside another app.'
+      : 'No motion data: page is not HTTPS, sensors are blocked. Open the https:// link shown on the host screen (accept the certificate warning).';
+    n = 0;
+  }, 500);
+}
+
+// Picks the classifier: Edge Impulse export in /model if present, else the built-in swing detector. Swap here.
+async function startClassifier(onMove) {
+  const hasModel = await fetch('/model/edge-impulse-standalone.js', { method: 'HEAD' })
+    .then(r => r.ok && /javascript/.test(r.headers.get('content-type') || '')).catch(() => false);
+  if (hasModel) { try { await startEdgeImpulse(onMove); return 'Edge Impulse model'; } catch (e) { $('dbg').textContent = 'Model failed: ' + e.message; } }
+  startHeuristic(onMove); $('calib').classList.remove('hidden'); return 'built-in detector';
+}
+const vec = o => o && [o.x || 0, o.y || 0, o.z || 0], dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2], norm = a => Math.hypot(...a) || 1e-6;
+
+// Edge Impulse WebAssembly export (edge-impulse-standalone.js + .wasm in /model). Trained on the Edge Impulse phone
+// client, so it expects accelerationIncludingGravity x/y/z in m/s2 at the model's frequency (62.5 Hz).
+// Model labels -> game moves (lower-cased). Labels not listed pass through unchanged (fh_slice, bh_topspin...).
+// In this model "serve" is the ball toss and "Hit" is the serve strike (only valid after the toss).
+const LABEL_MAP = { bounce: 'bounce', serve: 'toss', hit: 'serve', forward: 'fh', forehand: 'fh', backhand: 'bh', ruido: 'idle', noise: 'idle' };
+const mapLabel = l => LABEL_MAP[l.toLowerCase()] || l.toLowerCase();
+function startEdgeImpulse(onMove) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timeout loading /model')), 20000);
+    window.Module = { onRuntimeInitialized() {
+      clearTimeout(timer); const rc = Module.init();
+      if (typeof rc === 'number' && rc !== 0) return reject(new Error('init failed ' + rc));
+      const props = Module.get_properties();
+      const N = props.input_features_count || props.frame_sample_count * 3, dt = 1000 / props.frequency;
+      if (!(N > 0)) return reject(new Error('unknown window size'));
+      const win = []; let lastSample = 0, gesture = 0, active = false;
+      addEventListener('devicemotion', e => {                 // sliding window at the model's sample rate
+        const now = performance.now(); if (now - lastSample < dt - 1) return; lastSample = now;
+        const a = vec(e.accelerationIncludingGravity); if (!a) return;
+        win.push(...a); while (win.length > N) win.shift();
+      });
+      // Every 250 ms: send the whole (mapped) probability vector to the host, which picks the most probable move that is
+      // valid in the current game state. A gesture id increments on each rise above PICK_TH so one swing fires once.
+      setInterval(() => {
+        if (win.length < N) return;
+        try {
+          const ptr = Module._malloc(N * 4); Module.HEAPF32.set(win, ptr / 4);
+          const res = Module.run_classifier(ptr, N, false); Module._free(ptr);
+          if (res.result !== 0) return $('dbg').textContent = 'classifier error ' + res.result;
+          const probs = {}; let raw = { label: '', value: 0 };
+          for (let i = 0; i < res.size(); i++) { const c = res.get(i), l = mapLabel(c.label); probs[l] = (probs[l] || 0) + c.value; if (c.value > raw.value) raw = { label: c.label, value: c.value }; c.delete(); }
+          res.delete();
+          const top = Object.keys(probs).filter(l => l !== 'idle').reduce((b, l) => probs[l] > probs[b] ? l : b), nowActive = probs[top] >= PICK_TH && probs[top] >= (probs.idle || 0);
+          if (nowActive && !active) gesture++; active = nowActive;
+          $('dbg').textContent = `${raw.label} → ${mapLabel(raw.label)} ${raw.value.toFixed(2)}${nowActive ? ' · gesture ' + gesture : ''}`;
+          socket.emit('probs', { p: probs, g: gesture });
+        } catch (e) { $('dbg').textContent = 'classifier error: ' + e.message; }
+      }, 250);
+      resolve();
+    } };
+    const s = document.createElement('script'); s.src = '/model/edge-impulse-standalone.js'; s.onerror = () => reject(new Error('script failed')); document.body.appendChild(s);
+  });
+}
+
+// Built-in detector, no training needed. Hold the phone like a racket handle (top of the phone = racket head).
+// A swing starts when linear acceleration exceeds START; the first DIR_MS give the motion direction, the whole
+// SWING_MS the rotation about vertical (yaw). Vertical flick = toss / bounce, swing with the tip straight up = serve,
+// otherwise fh / bh by yaw sign (or by swing direction when there is no gyro), with topspin (low to high) or
+// slice (high to low) from the vertical component. "Calibrate" learns the forehand's yaw sign and direction.
+const START = 8, SWING_MS = 220, DIR_MS = 120, PICK_TH = 0.3;
+let calib = { yaw: 1, dir: null }, calibrating = false;
+try { calib = JSON.parse(localStorage.fableCalib) || calib; } catch {}
+function calibrate() { calibrating = true; $('calib').textContent = 'Swing a forehand now…'; }
+function startHeuristic(onMove) {
+  const g = [0, 0, 9.8]; let swing = null, lastT = 0, lastEmit = performance.now() + 600, gyro = false;
+  addEventListener('devicemotion', e => {
+    const now = performance.now(), dt = lastT ? Math.min(0.05, (now - lastT) / 1000) : 0.016; lastT = now;
+    const gi = vec(e.accelerationIncludingGravity); if (!gi) return;
+    const a = e.acceleration?.x != null ? vec(e.acceleration) : gi.map((v, i) => v - g[i]), m = norm(a); // linear acceleration
+    const rot = e.rotationRate?.alpha != null ? [e.rotationRate.beta || 0, e.rotationRate.gamma || 0, e.rotationRate.alpha] : null; // deg/s about x, y, z
+    if (rot) gyro = true;
+    if (!swing && m >= START && now >= lastEmit + 400) {                                 // swing starts (400 ms debounce)
+      const up = g.map(v => v / norm(g));                                                // "up" from the pre-swing gravity
+      swing = { t0: now, v: [0, 0, 0], yaw: 0, up, tip: Math.abs(up[1]), peak: 0 };
+    }
+    for (let i = 0; i < 3; i++) g[i] += (gi[i] - g[i]) * (m > 3 ? 0.02 : 0.1);         // low-passed gravity, slower while moving
+    if (!swing) return;
+    const age = now - swing.t0;
+    if (age < DIR_MS) for (let i = 0; i < 3; i++) swing.v[i] += a[i] * dt;
+    if (rot) swing.yaw += dot(rot, swing.up) * dt;
+    swing.peak = Math.max(swing.peak, m);
+    if (age < SWING_MS) return;
+    const vUp = dot(swing.v, swing.up), vH = swing.v.map((v, i) => v - vUp * swing.up[i]), h = norm(vH);
+    const spin = vUp > 0.35 * h ? '_topspin' : vUp < -0.35 * h ? '_slice' : '';
+    let label;
+    if (calibrating) {                                                                    // any swing counts as the forehand
+      calibrating = false; calib = { yaw: Math.sign(swing.yaw) || 1, dir: vH.map(v => v / h) };
+      try { localStorage.fableCalib = JSON.stringify(calib); } catch {}
+      $('calib').textContent = `Calibrated ✓ (${gyro ? 'gyro' : 'no gyro, using direction'})`; label = 'fh' + spin;
+    } else if (Math.abs(vUp) > 1.3 * h) label = vUp > 0 ? 'toss' : 'bounce';
+    else if (swing.tip > 0.85) label = 'serve';
+    else label = ((gyro ? swing.yaw * calib.yaw : calib.dir ? dot(vH, calib.dir) : 1) >= 0 ? 'fh' : 'bh') + spin;
+    const conf = Math.min(1, swing.peak / 30); swing = null; lastEmit = now; onMove(label, conf);
+  });
+}
+</script>
+</body></html>
